@@ -1,0 +1,224 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_percentage_error
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_percentage_error
+from scipy import stats
+import os
+
+def load_and_preprocess_data(csv_file):
+    try:
+        df = pd.read_csv('/content/personal_transactions (1).csv')
+        df.columns = df.columns.str.lower()
+        required_columns = {'date', 'amount'}
+        missing_columns = required_columns - set(df.columns.str.lower())
+
+        if missing_columns:
+            return {
+                'status': 'error',
+                'message': f"Missing required columns: {', '.join(missing_columns)}"
+            }
+
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.groupby('date').agg({'amount': 'sum'}).reset_index()
+
+        z_scores = np.abs(stats.zscore(df['amount']))
+        df = df[z_scores < 3]
+
+        return {
+            'status': 'success',
+            'data': df
+        }
+
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i+seq_length])
+        y.append(data[i+seq_length])
+    return np.array(X), np.array(y)
+
+class EnsembleModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(EnsembleModel, self).__init__()
+
+        # LSTM model
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+
+        # Simple RNN model
+        self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True)
+
+        self.dropout = nn.Dropout(0.2)
+        self.fc = nn.Linear(hidden_size, 70)
+        self.relu = nn.ReLU()
+        self.fc_out = nn.Linear(70, output_size)
+
+    def forward(self, x):
+
+        h0_lstm = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
+        c0_lstm = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
+        out_lstm, _ = self.lstm(x, (h0_lstm, c0_lstm))
+        out_lstm = self.dropout(out_lstm[:, -1, :])
+
+        h0_rnn = torch.zeros(self.rnn.num_layers, x.size(0), self.rnn.hidden_size).to(x.device)
+        out_rnn, _ = self.rnn(x, h0_rnn)
+        out_rnn = self.dropout(out_rnn[:, -1, :])
+
+        out = (out_lstm + out_rnn) / 2
+        out = self.fc(out)
+        out = self.relu(out)
+        out = self.fc_out(out)
+        return out
+
+def train_and_evaluate(model, train_loader, X_val, y_val, scaler, num_epochs=200):
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters())
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    for epoch in range(num_epochs):
+        model.train()
+        for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        val_predictions = model(X_val.to(device)).cpu().numpy()
+
+    val_predictions = scaler.inverse_transform(val_predictions)
+    y_val_actual = scaler.inverse_transform(y_val.numpy().reshape(-1, 1))
+
+    mape = mean_absolute_percentage_error(y_val_actual, val_predictions)
+    return model, mape
+
+def generate_forecast(model, last_sequence, forecast_days, scaler, device):
+    forecast = []
+    model.eval()
+    with torch.no_grad():
+        for _ in range(forecast_days):
+            next_pred = model(last_sequence).cpu().numpy()[0][0]
+            forecast.append(next_pred)
+            last_sequence = torch.roll(last_sequence, -1, dims=1)
+            last_sequence[0, -1, 0] = torch.tensor(next_pred, device=device)
+
+    forecast = scaler.inverse_transform(np.array(forecast).reshape(-1, 1))
+    forecast[forecast < 0] = 0.8
+    return forecast
+
+def train_and_forecast(csv_file):
+    result = load_and_preprocess_data(csv_file)
+
+    if 'status' not in result:
+        return {
+            'status': 'error',
+            'message': 'Unexpected response format from load_and_preprocess_data.'
+        }
+
+    if result['status'] == 'error':
+        return result
+
+    df_preprocessed = result.get('data')
+
+    if df_preprocessed is None or df_preprocessed.empty:
+        return {
+            'status': 'error',
+            'message': 'The preprocessed DataFrame is empty.'
+        }
+
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df_preprocessed['amount'].values.reshape(-1, 1))
+
+    seq_length = 30
+    X, y = create_sequences(scaled_data, seq_length)
+
+    X = torch.FloatTensor(X)
+    y = torch.FloatTensor(y)
+
+    train_dataset = TensorDataset(X, y)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = EnsembleModel(input_size=1, hidden_size=100, num_layers=3, output_size=1)
+
+    # Load existing model weights if they exist
+    model_weights_path = 'model_weights.pth'
+    if os.path.exists(model_weights_path):
+        model.load_state_dict(torch.load(model_weights_path))
+        print("Loaded existing model weights.")
+    else:
+        print("No existing model weights found. Training from scratch.")
+
+    model, mape = train_and_evaluate(model, train_loader, X, y, scaler)
+
+    # Save updated model weights
+    torch.save(model.state_dict(), model_weights_path)
+    print(f"Updated model weights saved.")
+
+    print(f"MAPE: {mape:.4f}")
+
+    last_sequence = torch.FloatTensor(scaled_data[-seq_length:]).unsqueeze(0).to(device)
+    forecast_days = 120
+    forecast = generate_forecast(model, last_sequence, forecast_days, scaler, device)
+
+    last_date = df_preprocessed['date'].max()
+    forecast_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=forecast_days)
+    forecast_df = pd.DataFrame({
+        'Date': forecast_dates,
+        'Amount': forecast.flatten()
+    })
+    forecast_df.to_csv('forecast.csv', index=False)
+
+    return {
+        'status': 'success',
+        'forecast': forecast_df,
+        'mape': mape
+    }
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def plot_forecast_vs_historical(forecast_csv, previous_csv):
+    forecast_df = pd.read_csv(forecast_csv)
+    previous_df = pd.read_csv(previous_csv)
+
+    forecast_df = forecast_df[['Date', 'Amount']]
+    previous_df = previous_df[['Date', 'Amount']]
+
+    forecast_df['Date'] = pd.to_datetime(forecast_df['Date'])
+    previous_df['Date'] = pd.to_datetime(previous_df['Date'])
+
+    plt.figure(figsize=(14, 7))
+
+    plt.plot(previous_df['Date'], previous_df['Amount'], label='Historical Data', color='blue')
+    plt.plot(forecast_df['Date'], forecast_df['Amount'], label='Forecast Data', color='orange')
+
+    plt.title('Historical Data and Forecast')
+    plt.xlabel('Date')
+    plt.ylabel('Amount')
+    plt.legend()
+    plt.xticks(rotation=45)
+
+    plt.tight_layout()
+    plt.show()
